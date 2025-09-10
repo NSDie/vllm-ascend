@@ -255,7 +255,7 @@ class AscendScheduler(Scheduler):
             # Count the number of prefix cached tokens.
             if request.num_cached_tokens < 0:
                 request.num_cached_tokens = num_computed_tokens
-
+            break
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
             self.waiting.extendleft(skipped_waiting_requests)

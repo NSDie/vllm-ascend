@@ -323,16 +323,44 @@ class AscendAttentionBackendImpl(AttentionImpl):
             mask = mask.repeat(attn_metadata.seq_lens.size(0), 1, 1, 1)
             mask = torch_npu.npu_format_cast(mask.contiguous(),
                                              ACL_FORMAT_FRACTAL_NZ)
+        if self.sliding_window is not None and \
+            attn_metadata.attn_mask.shape[0] > self.sliding_window:
+            slen = query.shape[0]
+            dim = query.shape[2]
+            query = query.view(1, slen, self.num_heads, dim).contiguous()
+            key = key.view(1, slen, self.num_kv_heads, dim).contiguous()
+            value = value.view(1, slen, self.num_kv_heads, dim).contiguous()
+            swa_mask = torch.ones(2048, 2048, dtype=torch.bool)
+            triu_mask = torch.triu(swa_mask, diagonal=1).to("npu")
+            tril_mask = torch.tril(swa_mask, -self.sliding_window).to("npu")
+            mask = triu_mask + tril_mask
 
-        torch_npu._npu_flash_attention(query=query,
-                                       key=key,
-                                       value=value,
-                                       mask=mask,
-                                       seq_len=attn_metadata.seq_lens,
-                                       scale_value=self.scale,
-                                       num_heads=self.num_heads,
-                                       num_kv_heads=self.num_kv_heads,
-                                       out=output)
+            output, _ = torch_npu.npu_fused_infer_attention_score(
+                query,
+                key,
+                value,
+                num_heads=self.num_heads,
+                num_key_value_heads=self.num_kv_heads,
+                input_layout="BSND",
+                pre_tokens=self.sliding_window,
+                next_tokens=0,
+                atten_mask=mask,
+                sparse_mode=4,
+                scale=self.scale,
+                actual_seq_lengths=attn_metadata.seq_lens,
+                actual_seq_lengths_kv=attn_metadata.seq_lens
+            )
+            output = output.view(num_tokens, self.num_heads, self.head_size)
+        else:
+            torch_npu._npu_flash_attention(query=query,
+                                        key=key,
+                                        value=value,
+                                        mask=mask,
+                                        seq_len=attn_metadata.seq_lens,
+                                        scale_value=self.scale,
+                                        num_heads=self.num_heads,
+                                        num_kv_heads=self.num_kv_heads,
+                                        out=output)
         assert output is not None
         return output[:num_tokens, :, :]
 

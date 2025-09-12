@@ -376,19 +376,44 @@ class AscendAttentionBackendImpl(AttentionImpl):
         compress_mask = attn_metadata.attn_mask
         batch_size = attn_metadata.query_lens.shape[0]
         block_table = attn_metadata.block_tables[:batch_size, :]
+        block_size = self.key_cache.shape[1]
+        num_tokens = query.shape[0]
+        query = query.view(batch_size, num_tokens, self.num_heads * self.head_size).contiguous()
+        key = self.key_cache
+        value = self.value_cache
+        if self.key_cache is not None and self.value_cache is not None:
+            block_size = self.key_cache.shape[1]
+            key = self.key_cache.flatten(2, 3).contiguous()
+            value = self.value_cache.flatten(2, 3).contiguous()
+        
+        if self.sliding_window is not None:
+            swa_mask = torch.ones(2048, 2048, dtype=torch.bool)
+            triu_mask = torch.triu(swa_mask, diagonal=1).to("npu")
+            tril_mask = torch.tril(swa_mask, -self.sliding_window).to("npu")
+            mask = triu_mask + tril_mask
+            sparse_mode = 4
+        else:
+            mask = None
+            sparse_mode = 0
 
-        torch_npu._npu_flash_attention_qlens(
-            query=query,
-            key_cache=self.key_cache,
-            value_cache=self.value_cache,
-            block_table=block_table,
-            mask=compress_mask,
-            seq_len=attn_metadata.query_lens,
-            context_lens=attn_metadata.seq_lens,
-            num_kv_heads=self.num_kv_heads,
+        output, _ =torch_npu.npu_fused_infer_attention_score(
+            query,
+            key,
+            value,
             num_heads=self.num_heads,
-            scale_value=self.scale,
-            out=output)
+            num_key_value_heads=self.num_kv_heads,
+            input_layout="BSH",
+            pre_tokens=self.sliding_window if self.sliding_window is not None else 2147483647,
+            next_tokens=0 if self.sliding_window is not None else 2147483647,
+            atten_mask=mask,
+            sparse_mode=sparse_mode,
+            scale=self.scale,
+            block_table=block_table,
+            block_size=block_size,
+            actual_seq_lengths=attn_metadata.query_lens,
+            actual_seq_lengths_kv=attn_metadata.seq_lens
+        )
+        output = output.view(num_tokens, self.num_heads, self.head_size)
         return output
 
     def _forward_decode_only(
